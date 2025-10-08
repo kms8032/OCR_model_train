@@ -6,7 +6,10 @@ __pycache__/
 # Data & runs
 dataset/
 mlruns/
-checkpoints/
+
+# Checkpoints
+checkpoints/*
+!checkpoints/crnn_best.pth
 best.pt
 
 # Envs
