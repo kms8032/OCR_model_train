@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data & runs
+dataset/
+mlruns/
+checkpoints/
+best.pt
+
+# Envs
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
