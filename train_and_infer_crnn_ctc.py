@@ -18,7 +18,7 @@ CSV_PATH = os.path.join(DATA_DIR, "labels.csv")
 
 IMG_W, IMG_H = 128, 32
 BATCH_SIZE   = 64
-EPOCHS       = 70
+EPOCHS       = 40
 LR           = 1e-4
 SEED         = 42
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,7 +91,7 @@ class PlateOCRDataset(Dataset):
 
 train_tf = T.Compose([
     T.Resize((IMG_H, IMG_W)),
-    T.ColorJitter(brightness=0.3, contrast=0.3),  # 증강(원본 파일은 건드리지 않음)
+    T.ColorJitter(brightness=0.3, contrast=0.3),
     T.ToTensor(),
     T.Normalize([0.5], [0.5])
 ])
@@ -102,85 +102,64 @@ val_tf = T.Compose([
 ])
 
 # =========================
-# 유틸: 파일명 0패딩
+# CSV Split (train / val / test)
 # =========================
-def pad_stem_if_numeric(filename: str, width: int = 4) -> str:
-    name, ext = os.path.splitext(filename)
-    # 이름이 전부 숫자일 때만 패딩 (예: '1.png' -> '0001.png')
-    if name.isdigit():
-        return f"{int(name):0{width}d}{ext}"
-    return filename
-
-# =========================
-# CSV Split (헤더 자동감지 + 0패딩 + 라벨단위 분할)
-# =========================
-def split_csv(csv_path, out_train, out_val, ratio=0.8, group_by_label: bool = True, pad_width: int = 4):
+def split_csv(csv_path, out_train, out_val, out_test, ratio_train=0.8, ratio_val=0.1, group_by_label=True):
     rows = []
-
-    # 1) 헤더 유무 자동 판단
     with open(csv_path, newline="", encoding="utf-8") as f:
         first_line = f.readline()
         f.seek(0)
         if ("filename" in first_line.lower()) and ("label" in first_line.lower()):
-            # 정상 헤더
             rdr = csv.DictReader(f)
             for r in rdr:
                 rows.append({"filename": r["filename"], "label": r["label"]})
         else:
-            # 헤더 없음 → reader로 읽어서 강제 매핑
             print("[Info] No header detected in labels.csv. Assuming 'filename,label' format.")
             rdr = csv.reader(f)
             for r in rdr:
-                if len(r) < 2: 
-                    continue
-                rows.append({"filename": r[0], "label": r[1]})
+                if len(r) >= 2:
+                    rows.append({"filename": r[0], "label": r[1]})
 
-    # 2) 파일명 0패딩 적용
-    for r in rows:
-        r["filename"] = pad_stem_if_numeric(r["filename"], width=pad_width)
-
-    # 3) 이미지 존재하는 것만 유지(여기서 1차 필터)
-    filtered = []
-    missing = 0
-    for r in rows:
-        img_path = os.path.join(IMG_DIR, r["filename"])
-        if os.path.exists(img_path):
-            filtered.append(r)
-        else:
-            missing += 1
-    if missing > 0:
-        print(f"[Warning] {missing} file(s) listed in labels.csv not found in images/. They will be dropped.")
+    # 이미지 존재 확인
+    filtered = [r for r in rows if os.path.exists(os.path.join(IMG_DIR, r["filename"]))]
 
     if not filtered:
-        raise RuntimeError("No valid rows after filtering. Check your labels.csv and images/ folder.")
+        raise RuntimeError("No valid rows after filtering. Check labels.csv and images folder.")
 
-    # 4) 분할: (옵션) 같은 라벨 단위로 분할 → 데이터 누수 방지
     if group_by_label:
         grouped = {}
         for r in filtered:
             grouped.setdefault(r["label"], []).append(r)
         labels = list(grouped.keys())
         random.shuffle(labels)
-        n_train_labels = int(len(labels) * ratio)
-        train_labels = set(labels[:n_train_labels])
+        n_train = int(len(labels) * ratio_train)
+        n_val   = int(len(labels) * ratio_val)
+        train_labels = set(labels[:n_train])
+        val_labels   = set(labels[n_train:n_train+n_val])
 
-        train_rows, val_rows = [], []
+        train_rows, val_rows, test_rows = [], [], []
         for lab, samples in grouped.items():
-            (train_rows if lab in train_labels else val_rows).extend(samples)
+            if lab in train_labels:
+                train_rows.extend(samples)
+            elif lab in val_labels:
+                val_rows.extend(samples)
+            else:
+                test_rows.extend(samples)
     else:
         random.shuffle(filtered)
-        n = int(len(filtered) * ratio)
-        train_rows, val_rows = filtered[:n], filtered[n:]
+        n_train = int(len(filtered) * ratio_train)
+        n_val = int(len(filtered) * ratio_val)
+        train_rows = filtered[:n_train]
+        val_rows   = filtered[n_train:n_train+n_val]
+        test_rows  = filtered[n_train+n_val:]
 
-    # 5) 저장
-    with open(out_train, "w", newline="", encoding="utf-8") as f:
-        wr = csv.DictWriter(f, fieldnames=["filename","label"])
-        wr.writeheader(); wr.writerows(train_rows)
-    with open(out_val, "w", newline="", encoding="utf-8") as f:
-        wr = csv.DictWriter(f, fieldnames=["filename","label"])
-        wr.writeheader(); wr.writerows(val_rows)
-
-    print(f"[Split] Train: {len(train_rows)} | Val: {len(val_rows)} (group_by_label={group_by_label})")
+    # CSV 저장
+    for path, rows in [(out_train, train_rows), (out_val, val_rows), (out_test, test_rows)]:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            wr = csv.DictWriter(f, fieldnames=["filename", "label"])
+            wr.writeheader()
+            wr.writerows(rows)
+    print(f"[Split] Train: {len(train_rows)} | Val: {len(val_rows)} | Test: {len(test_rows)}")
 
 def collate_fn(batch):
     imgs, labels = zip(*batch)
@@ -195,7 +174,7 @@ class CRNN(nn.Module):
     def __init__(self, num_classes: int, hidden=256):
         super().__init__()
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2,2),
+            nn.Conv2d(1,64,3,1,1), nn.ReLU(), nn.MaxPool2d(2,2),
             nn.Conv2d(64,128,3,1,1), nn.ReLU(), nn.MaxPool2d(2,2),
             nn.Conv2d(128,256,3,1,1), nn.ReLU(),
             nn.Conv2d(256,256,3,1,1), nn.ReLU(), nn.MaxPool2d((2,2)),
@@ -234,22 +213,25 @@ def cer(preds: List[str], gts: List[str]) -> float:
     return dist / max(tot,1)
 
 # =========================
-# Train 함수 with MLflow
+# Train 함수
 # =========================
 def train():
     os.makedirs("checkpoints", exist_ok=True)
     tr_csv = os.path.join(DATA_DIR, "train.csv")
     va_csv = os.path.join(DATA_DIR, "val.csv")
+    te_csv = os.path.join(DATA_DIR, "test.csv")
 
-    # 헤더 자동감지 + 0패딩 + 라벨단위 분할 + 존재 확인
-    split_csv(CSV_PATH, tr_csv, va_csv, ratio=0.8, group_by_label=True, pad_width=4)
+    split_csv(CSV_PATH, tr_csv, va_csv, te_csv, ratio_train=0.8, ratio_val=0.1)
 
     train_ds = PlateOCRDataset(tr_csv, IMG_DIR, transform=train_tf)
     val_ds   = PlateOCRDataset(va_csv, IMG_DIR, transform=val_tf)
+    test_ds  = PlateOCRDataset(te_csv, IMG_DIR, transform=val_tf)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=2, pin_memory=True, collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=2, pin_memory=True, collate_fn=collate_fn)
+    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=True, collate_fn=collate_fn)
 
     num_classes = 1 + len(CHARS)
@@ -258,89 +240,78 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE=="cuda"))
 
-    # ===== MLflow Logging Start =====
     mlflow.start_run()
-    mlflow.log_param("img_size", (IMG_W, IMG_H))
-    mlflow.log_param("batch_size", BATCH_SIZE)
-    mlflow.log_param("epochs", EPOCHS)
-    mlflow.log_param("learning_rate", LR)
-    mlflow.log_param("optimizer", "Adam")
-    mlflow.log_param("device", DEVICE)
-    mlflow.log_param("num_classes", num_classes)
-
     best_val = float("inf")
+
     for epoch in range(1, EPOCHS+1):
         # ---- Train ----
         model.train()
         tr_loss = 0.0
         for imgs, labels, targets, target_lengths in train_loader:
-            imgs = imgs.to(DEVICE)
-            targets = targets.to(DEVICE)
-            target_lengths = target_lengths.to(DEVICE)
-
+            imgs, targets, target_lengths = imgs.to(DEVICE), targets.to(DEVICE), target_lengths.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(DEVICE=="cuda")):
                 logits, T_steps = model(imgs)
                 log_probs = logits.log_softmax(2)
                 input_lengths = torch.full((logits.size(1),), T_steps, dtype=torch.long, device=DEVICE)
                 loss = criterion(log_probs, targets, input_lengths, target_lengths)
-
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer); scaler.update()
             tr_loss += loss.item()
 
-        # ---- Val ----
+        # ---- Validation ----
         model.eval()
-        vl_loss = 0.0
-        all_preds, all_gts = [], []
+        vl_loss, all_preds, all_gts = 0.0, [], []
         with torch.no_grad():
             for imgs, labels, targets, target_lengths in val_loader:
-                imgs = imgs.to(DEVICE)
-                targets = targets.to(DEVICE)
-                target_lengths = target_lengths.to(DEVICE)
-
+                imgs, targets, target_lengths = imgs.to(DEVICE), targets.to(DEVICE), target_lengths.to(DEVICE)
                 logits, T_steps = model(imgs)
                 log_probs = logits.log_softmax(2)
                 input_lengths = torch.full((logits.size(1),), T_steps, dtype=torch.long, device=DEVICE)
                 loss = criterion(log_probs, targets, input_lengths, target_lengths)
                 vl_loss += loss.item()
-
                 preds = converter.decode_greedy(log_probs.cpu())
-                all_preds.extend(preds)
-                all_gts.extend(list(labels))
-
+                all_preds.extend(preds); all_gts.extend(list(labels))
         val_cer = cer(all_preds, all_gts)
 
-        # 콘솔 출력
-        print(f"[Epoch {epoch:02d}] train {tr_loss/len(train_loader):.4f} | "
-              f"val {vl_loss/len(val_loader):.4f} | CER {val_cer:.4f}")
-
-        # ===== MLflow Log =====
+        print(f"[Epoch {epoch:02d}] train {tr_loss/len(train_loader):.4f} | val {vl_loss/len(val_loader):.4f} | CER {val_cer:.4f}")
         mlflow.log_metric("train_loss", tr_loss/len(train_loader), step=epoch)
         mlflow.log_metric("val_loss", vl_loss/len(val_loader), step=epoch)
         mlflow.log_metric("val_cer", val_cer, step=epoch)
 
-        # 샘플 예측 저장 (첫 번째 배치만 기록)
-        if epoch % 10 == 0:
-            sample_preds = "\n".join([f"{p} | {g}" for p,g in zip(all_preds[:100], all_gts[:100])])
-            mlflow.log_text(sample_preds, f"sample_predictions_{epoch}.txt")
-
-        # 체크포인트 저장
+        # ---- Save Best ----
         if vl_loss < best_val:
             best_val = vl_loss
-            ckpt = {
-                "model": model.state_dict(),
-                "chars": CHARS,
-                "img_size": (IMG_W, IMG_H)
-            }
-            path = "checkpoints/crnn_best.pth"
-            torch.save(ckpt, path)
-            print(f"  -> saved {path}")
-            mlflow.pytorch.log_model(model, name="crnn_model")
+            torch.save({"model": model.state_dict(), "chars": CHARS}, "checkpoints/crnn_best.pth")
+            print("  -> saved best checkpoint")
+
+    # ======================
+    # ✅ 학습 후 TEST 평가
+    # ======================
+    print("\n[Testing best model...]")
+    best_ckpt = torch.load("checkpoints/crnn_best.pth", map_location=DEVICE)
+    model.load_state_dict(best_ckpt["model"])
+    model.eval()
+    te_loss, preds, gts = 0.0, [], []
+    with torch.no_grad():
+        for imgs, labels, targets, target_lengths in test_loader:
+            imgs, targets, target_lengths = imgs.to(DEVICE), targets.to(DEVICE), target_lengths.to(DEVICE)
+            logits, T_steps = model(imgs)
+            log_probs = logits.log_softmax(2)
+            input_lengths = torch.full((logits.size(1),), T_steps, dtype=torch.long, device=DEVICE)
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            te_loss += loss.item()
+            decoded = converter.decode_greedy(log_probs.cpu())
+            preds.extend(decoded); gts.extend(list(labels))
+    test_cer = cer(preds, gts)
+    test_loss = te_loss / len(test_loader)
+    print(f"[Test] loss {test_loss:.4f} | CER {test_cer:.4f}")
+
+    mlflow.log_metric("test_loss", test_loss)
+    mlflow.log_metric("test_cer", test_cer)
 
     mlflow.end_run()
-    print("Done training.")
+    print("Done training + testing.")
 
 if __name__ == "__main__":
     train()
