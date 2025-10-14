@@ -60,12 +60,16 @@ def smooth_box(prev_box, new_box, alpha=0.7):
 
 history = deque(maxlen=10)
 
+# =====================
+# 보정(스무딩 & 투표) → 4자리 제한 적용
+# =====================
 def stabilize_text(new_text):
-    """OCR 결과 안정화 (길이 제한 없음)"""
+    """OCR 결과 안정화 (4자리 숫자만 유효)"""
     import re
     new_text = re.sub(r'[^0-9]', '', new_text)  # 숫자만 남기기
 
-    if len(new_text) == 0:  # 빈 문자열이면 무시
+    # 4자리가 아니면 무시
+    if len(new_text) != 4:
         return None
 
     history.append(new_text)
@@ -102,25 +106,8 @@ while True:
         prev_box = smooth
         (x1, y1, x2, y2) = smooth
 
-        # =====================
-        # 영상 표시용 박스 (적당히 shrink)
-        # =====================
-        shrink_x, shrink_y = 5, 3
-        dx1 = max(0, x1 + shrink_x)
-        dy1 = max(0, y1 + shrink_y)
-        dx2 = min(frame.shape[1]-1, x2 - shrink_x)
-        dy2 = min(frame.shape[0]-1, y2 - shrink_y)
-
-        # =====================
-        # OCR용 crop (더 타이트하게 shrink)
-        # =====================
-        ocr_shrink_x, ocr_shrink_y = 8, 5
-        ox1 = max(0, x1 + ocr_shrink_x)
-        oy1 = max(0, y1 + ocr_shrink_y)
-        ox2 = min(frame.shape[1]-1, x2 - ocr_shrink_x)
-        oy2 = min(frame.shape[0]-1, y2 - ocr_shrink_y)
-
-        crop = frame[oy1:oy2, ox1:ox2]
+        # crop
+        crop = frame[y1:y2, x1:x2]
 
         if crop.size > 0:
             pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
@@ -128,9 +115,8 @@ while True:
             final_text = stabilize_text(pred_text)
 
             if final_text:  # 숫자 길이에 상관없이 출력
-                # 영상에는 보기 좋은 박스 + 텍스트 출력
-                cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 255, 0), 2)
-                cv2.putText(frame, final_text, (dx1, dy1 - 10),
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, final_text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
 
     cv2.imshow("YOLO + OCR", frame)
